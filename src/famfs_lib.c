@@ -1395,6 +1395,22 @@ __famfs_logplay(
 				skip_file++;
 			}
 
+			snprintf(fullpath, PATH_MAX - 1, "%s/%s", mpt, fc->famfs_relpath);
+			realpath(fullpath, rpath);
+			rc = stat(rpath, &st);
+			/* Check if file has been deleted */
+			if (!fc->famfs_nextents) {
+				if (verbose) {
+					fprintf(stdout, "famfs logplay: deleting file %s", 
+						fc->famfs_relpath);
+				}
+				/* If file exists, unlink it*/
+				if (!rc) {
+					unlink(rpath);
+				}
+				skip_file++;
+			}
+
 			/* The only file that should have an extent with offset 0
 			 * is the superblock, which is not in the log. Check for files with
 			 * null offset...
@@ -1414,12 +1430,9 @@ __famfs_logplay(
 			if (skip_file)
 				continue;
 
-			snprintf(fullpath, PATH_MAX - 1, "%s/%s", mpt, fc->famfs_relpath);
-			realpath(fullpath, rpath);
 			if (dry_run)
 				continue;
 
-			rc = stat(rpath, &st);
 			if (!rc) {
 				if (verbose > 1)
 					fprintf(stderr, "famfs logplay: File %s exists\n",
@@ -2412,8 +2425,12 @@ famfs_build_bitmap(const struct famfs_log   *logp,
 		case FAMFS_LOG_FILE: {
 			const struct famfs_file_creation *fc = &le->famfs_fc;
 			const struct famfs_log_extent *ext = fc->famfs_ext_list;
+			
+			if (fc->famfs_nextents){
+				/* If no extents then the file was deleted and shouldn't count */
+				ls.f_logged++;
+			}
 
-			ls.f_logged++;
 			fsize_sum += fc->famfs_fc_size;
 			if (verbose > 1)
 				printf("%s: file=%s size=%lld\n", __func__,
@@ -4181,3 +4198,99 @@ famfs_flush_file(const char *filename, int verbose)
 	hard_flush_processor_cache(addr, size);
 	return 0;
 }
+
+
+/**************AJINKYA CHANGE***********************/
+
+/**
+ * Function to deallocate memory for a file
+ */
+int famfs_free_file_memory(const char *filepath) {
+	/*These next few steps are how famfs creates the filepath it will store in the log
+	 * entry for the file. We need to do this to use the filepath as a way to search
+	 * for the file in the log, so we can change the log entry for deletion.
+	 */
+	struct famfs_locked_log lp;
+	struct famfs_log *logp;
+	int rc;
+	char fullpath[PATH_MAX];
+	char mpt[PATH_MAX];
+	char *relpath;
+	rc = famfs_init_locked_log(&lp, filepath, 0);
+	if (rc)
+		return rc;
+
+	assert(realpath(filepath, fullpath));
+	/* unlink the file once we have the fullpath */
+
+    logp = lp.logp;
+	strncpy(mpt, lp.mpt, PATH_MAX - 1);
+
+	/* For the log, we need the path relative to the mount point.
+	 * getting this before we allocate is cleaner if the path is sombhow bogus
+	 */
+	relpath = famfs_relpath_from_fullpath(mpt, fullpath);
+	for (int i = 0; i < logp->famfs_log_next_index; i++) {
+		struct famfs_log_entry le = logp->entries[i];
+		if (le.famfs_log_entry_type == FAMFS_LOG_FILE) {
+			const struct famfs_file_creation *fc = &le.famfs_fc;
+			if (strcmp(fc->famfs_relpath, relpath) == 0) {
+				/* Found the file in the log */
+				struct famfs_log_entry new_le = {0};
+				struct famfs_file_creation *new_fc = &new_le.famfs_fc;
+
+				new_le.famfs_log_entry_type = FAMFS_LOG_FILE;
+
+				new_fc->famfs_fc_size = 0;
+				new_fc->famfs_nextents = 0;
+				new_fc->famfs_fc_flags = fc->famfs_fc_flags;
+
+				strncpy((char *)new_fc->famfs_relpath, relpath, FAMFS_MAX_PATHLEN - 1);
+
+				new_fc->fc_mode = fc->fc_mode;
+				new_fc->fc_uid  = fc->fc_uid;
+				new_fc->fc_gid  = fc->fc_gid;
+				new_le.famfs_log_entry_crc = famfs_gen_log_entry_crc(&new_le);
+				new_le.famfs_log_entry_seqnum = le.famfs_log_entry_seqnum;
+
+				memcpy(&logp->entries[i], &new_le, sizeof(new_le));
+				flush_processor_cache(logp, logp->famfs_log_len);
+				return 0;			
+			}
+		}
+	}
+    return -1;
+}
+
+/**
+ * Remove a file from FAMFS without shared memory dependencies.
+ */
+int famfs_rm(const char *filepath) {
+    struct stat file_stat;
+
+    if (stat(filepath, &file_stat) != 0) {
+        perror("Error: File does not exist");
+        return -1;
+    }
+
+    if (S_ISDIR(file_stat.st_mode)) {
+        fprintf(stderr, "Error: %s is a directory. Use rmdir instead.\n", filepath);
+        return -1;
+    }
+
+    if (famfs_free_file_memory(filepath) != 0) {
+        fprintf(stderr, "Error freeing memory for file: %s\n", filepath);
+        return -1;
+    }
+
+    if (unlink(filepath) != 0) {
+        perror("Error removing file");
+        return -1;
+    }
+
+    printf("File %s removed successfully.\n", filepath);
+    return 0;
+}
+
+
+/**************************************************/ 

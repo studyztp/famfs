@@ -57,4 +57,10 @@ int famfs_flush_file(const char *filename, int verbose);
 int file_not_famfs(const char *fname);
 s64 get_multiplier(const char *endptr);
 
+
+/**************AJINKYA CHANGE***********************/
+int famfs_rm(const char *filepath);
+int famfs_free_file_memory(const char *filepath);
+/**************************************************/
+
 #endif /* _H_FAMFS_LIB */
