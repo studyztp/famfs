@@ -1,7 +1,7 @@
 # FAMFS with File Removal and Non-Contiguous Allocation Support  
 
 ## Overview  
-This repository improves upon **FAMFS (Fault-Tolerant and Adaptive Multi-Node File System)** by adding **file removal functionality** and **non-contiguous allocation**. These enhancements allow FAMFS to properly free and reuse storage space after file deletions, preventing false "Out of Space" errors.  
+This repository improves upon **FAMFS (Famfs Shared Memory Filesystem Framework)** by adding **file removal functionality** and **non-contiguous allocation**. These enhancements allow FAMFS to properly free and reuse storage space after file deletions, preventing false "Out of Space" errors.  
 
 ## Improvements  
 
