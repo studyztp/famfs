@@ -1583,6 +1583,30 @@ do_famfs_cli_chkread(int argc, char *argv[])
 /********************************************************************/
 
 
+
+
+/**************AJINKYA CHANGE***********************/
+
+int do_famfs_cli_rm(int argc, char *argv[]) {
+    if (argc < 3) {
+        fprintf(stderr, "Usage: %s <file_path>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+	int error;
+	for (int i = 2; i < argc; i++) {
+		error = famfs_rm(argv[i]);
+		if (error == -1){
+			fprintf(stderr, "Error in removal of %s\n", argv[i]);
+			return EXIT_FAILURE;
+		}
+	}
+    return 0;
+}
+/******************************************************************/
+
+
+
+
 struct famfs_cli_cmd {
 	char *cmd;
 	int (*run)(int argc, char **argv);
@@ -1607,7 +1631,7 @@ famfs_cli_cmd famfs_cli_cmds[] = {
 	{"getmap",  do_famfs_cli_getmap,  famfs_getmap_usage},
 	{"clone",   do_famfs_cli_clone,   famfs_clone_usage},
 	{"chkread", do_famfs_cli_chkread, famfs_chkread_usage},
-
+	{"rm", do_famfs_cli_rm, NULL},  //Ajinkya Change
 	{NULL, NULL, NULL}
 };
 
@@ -1677,4 +1701,3 @@ main(int argc, char **argv)
 
 	return -1;
 }
-
