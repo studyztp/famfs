@@ -1019,6 +1019,8 @@ famfs_file_map_create(
 
 	/* TODO: check for overflow (nextents > max_extents) */
 	for (i = 0; i < nextents; i++) {
+		printf("ext_list[%d].offset = %lld\n", i, ext_list[i].famfs_extent_offset);
+		printf("ext_list[%d].len    = %lld\n", i, ext_list[i].famfs_extent_len);
 		filemap.ext_list[i].offset = ext_list[i].famfs_extent_offset;
 		filemap.ext_list[i].len    = ext_list[i].famfs_extent_len;
 	}
@@ -1467,8 +1469,8 @@ __famfs_logplay(
 			for (j = 0; j < fc->famfs_nextents; j++) {
 				const struct famfs_log_extent *tle = &fc->famfs_ext_list[j];
 
-				el[j].famfs_extent_offset = tle[j].se.famfs_extent_offset;
-				el[j].famfs_extent_len    = tle[j].se.famfs_extent_len;
+				el[j].famfs_extent_offset = tle->se.famfs_extent_offset;
+				el[j].famfs_extent_len    = tle->se.famfs_extent_len;
 			}
 			famfs_file_map_create(rpath, fd, fc->famfs_fc_size,
 					      fc->famfs_nextents, el, FAMFS_REG);
@@ -2337,13 +2339,14 @@ static inline u64 set_extent_in_bitmap(u8 *bitmap, u64 offset, u64 len, u64 *all
 	assert(!(offset & (FAMFS_ALLOC_UNIT  - 1)));
 
 	page_num = offset / FAMFS_ALLOC_UNIT;
-	np = (len + FAMFS_ALLOC_UNIT - 1) / FAMFS_ALLOC_UNIT;
+	np = len / FAMFS_ALLOC_UNIT;
 
 	for (k = page_num; k < (page_num + np); k++) {
-		rc = mu_bitmap_test_and_set(bitmap, k);
-		if (rc == 0) {
+		rc = mu_bitmap_test(bitmap, k);
+		if (rc) {
 			errors++; /* bit was already set */
 		} else {
+			mu_bitmap_set(bitmap, k);
 			/* Don't count double allocations */
 			if (alloc_sum)
 				*alloc_sum += FAMFS_ALLOC_UNIT;
@@ -2446,6 +2449,11 @@ famfs_build_bitmap(const struct famfs_log   *logp,
 
 				rc = set_extent_in_bitmap(bitmap, ofs, len, &alloc_sum);
 				errors += rc;
+
+				if (rc) {
+					fprintf(stderr, "%s: error: rc=%lld extent %lld %lld already allocated\n",
+						__func__, rc, ofs, len);
+				}
 			}
 			break;
 		}
@@ -2460,6 +2468,7 @@ famfs_build_bitmap(const struct famfs_log   *logp,
 			break;
 		}
 	}
+
 	if (verbose > 1) {
 		mu_print_bitmap(bitmap, nbits);
 	}
@@ -2519,6 +2528,91 @@ next:
 	}
 	fprintf(stderr, "%s: alloc failed\n", __func__);
 	return -1;
+}
+
+/**
+ * bitmap_alloc_noncontiguous()
+ *
+ * @bitmap
+ * @nbits - number of bits in the bitmap
+ * @alloc_size - size to allocate in bytes (must convert to bits)
+ * @ext_list - list of famfs_log_extent structs to fill in
+ *
+ * Return value: if successful, it returns the number of log in list, 
+ * otherwise, it returns -1
+ */
+static u64
+bitmap_alloc_noncontiguous(u8 *bitmap,
+			u64 nbits,
+			u64 alloc_size,
+			u64 *cur_pos,
+			struct famfs_simple_extent ext_list[])
+{
+	u64 i;
+	// The total bits we need to allocate
+	u64 alloc_bits = (alloc_size + FAMFS_ALLOC_UNIT - 1) /  FAMFS_ALLOC_UNIT;
+	// The remaining bits in the bitmap. This is for quick rough check. If
+	// the remaining bits are not enough, we can return -1 immediately.
+	u64 bitmap_remainder;
+	// The remaining bits we need to allocate.
+	u64 remain_needed_bits = alloc_bits;
+	u64 len = 0;
+	u64 offset = 0;
+	// The iterator for the ext_list
+	u64 ext_list_iter = 0;
+
+	for (i = *cur_pos; i < nbits; i++) {
+		/* Skip bits that are set... */
+		if (mu_bitmap_test(bitmap, i)) {
+			// If there are some bits that are set, we need to store the
+			// current extent if we have some bits in the extent.
+			if (len > 0) {
+				ext_list[ext_list_iter].famfs_extent_offset = offset * FAMFS_ALLOC_UNIT;
+				ext_list[ext_list_iter].famfs_extent_len = len * FAMFS_ALLOC_UNIT;
+				len = 0;
+				ext_list_iter++;
+			}
+			continue;
+		}
+
+		if(len == 0)
+			offset = i;
+
+		bitmap_remainder = nbits - i;
+		/* Remaining space is not enough */
+		if (remain_needed_bits > bitmap_remainder) 
+			return -1;
+
+		// if we reach here, we know that the bits at i is available.
+		mu_bitmap_set(bitmap, i);
+		remain_needed_bits--;
+		len ++;
+
+		if (remain_needed_bits == 0) {
+			ext_list[ext_list_iter].famfs_extent_offset = offset * FAMFS_ALLOC_UNIT;
+			ext_list[ext_list_iter].famfs_extent_len = len * FAMFS_ALLOC_UNIT;
+			ext_list_iter++;
+			break;
+		}
+	}
+
+	*cur_pos = i+len;
+
+	// count the number of bits that are set in the bitmap
+
+	for (i = 0; i < ext_list_iter; i++) {
+		u64 offset = ext_list[i].famfs_extent_offset / FAMFS_ALLOC_UNIT;
+		u64 len = ext_list[i].famfs_extent_len / FAMFS_ALLOC_UNIT;
+		printf("offset: %lld, len: %lld\n", offset, len);
+	}
+
+	if (remain_needed_bits > 0) {
+		fprintf(stderr, "%s: alloc failed\n", __func__);
+		return -1;
+	} else {
+		return ext_list_iter;
+	}
+
 }
 
 /**
@@ -2601,6 +2695,32 @@ famfs_alloc_contiguous(struct famfs_locked_log *lp, u64 size, int verbose)
 	return bitmap_alloc_contiguous(lp->bitmap, lp->nbits, size, &lp->cur_pos);
 }
 
+/**
+ * famfs_alloc_noncontiguous()
+ *
+ * @lp      - locked log struct. Will perform bitmap build if no already done
+ * @size
+ * @ext_list - list of famfs_log_extent structs to fill in
+ * @verbose
+ */
+static s64
+famfs_alloc_noncontiguous(
+	struct famfs_locked_log *lp, u64 size, 
+	struct famfs_simple_extent ext_list[], int verbose)
+{
+	if (!lp->bitmap) {
+		/* Bitmap is needed and hasn't been built yet */
+		lp->bitmap = famfs_build_bitmap(lp->logp, lp->devsize, &lp->nbits,
+						NULL, NULL, NULL, NULL, verbose);
+		if (!lp->bitmap) {
+			fprintf(stderr, "%s: failed to allocate bitmap\n", __func__);
+			return -1;
+		}
+		lp->cur_pos = 0;
+	}
+	return bitmap_alloc_noncontiguous(
+		lp->bitmap, lp->nbits, size, &lp->cur_pos, ext_list);
+}
 
 int
 famfs_release_locked_log(struct famfs_locked_log *lp)
@@ -2676,26 +2796,51 @@ famfs_file_alloc(
 	if (!relpath)
 		return -EINVAL;
 
-	offset = famfs_alloc_contiguous(lp, size, verbose);
-	if (offset < 0) {
+	// original code
+	// offset = famfs_alloc_contiguous(lp, size, verbose);
+	// if (offset < 0) {
+	// 	rc = -ENOMEM;
+	// 	fprintf(stderr, "%s: Out of space!\n", __func__);
+	// 	//assert(0);
+	// 	goto out;
+	// }
+	// /* Allocation at offset 0 is always wrong - the superblock lives there */
+	// assert(offset != 0);
+
+	// ext.famfs_extent_len    = round_size_to_alloc_unit(size);
+	// ext.famfs_extent_offset = offset;
+
+	// printf("%s: offset %lld len %lld\n", __func__, ext.famfs_extent_offset, ext.famfs_extent_len);
+
+	// rc = famfs_log_file_creation(logp, 1, &ext,
+	// 			     relpath, mode, uid, gid, size);
+	// if (rc)
+	// 	goto out;
+
+	// if (!mock_kmod)
+	// 	rc =  famfs_file_map_create(path, fd, size, 1, &ext, FAMFS_REG);
+	
+	// original code end
+	
+	struct famfs_simple_extent ext_list[FAMFS_FC_MAX_EXTENTS];
+	s64 nextents = famfs_alloc_noncontiguous(lp, size, ext_list, verbose);
+
+	if (nextents <= 0) {
 		rc = -ENOMEM;
 		fprintf(stderr, "%s: Out of space!\n", __func__);
-		//assert(0);
 		goto out;
 	}
-	/* Allocation at offset 0 is always wrong - the superblock lives there */
-	assert(offset != 0);
 
-	ext.famfs_extent_len    = round_size_to_alloc_unit(size);
-	ext.famfs_extent_offset = offset;
+	printf("%s: nextents %lld\n", __func__, nextents);
 
-	rc = famfs_log_file_creation(logp, 1, &ext,
-				     relpath, mode, uid, gid, size);
+	rc = famfs_log_file_creation(logp, nextents, ext_list,
+					 relpath, mode, uid, gid, size);	
+
 	if (rc)
 		goto out;
 
 	if (!mock_kmod)
-		rc =  famfs_file_map_create(path, fd, size, 1, &ext, FAMFS_REG);
+		rc =  famfs_file_map_create(path, fd, size, nextents, ext_list, FAMFS_REG);
 out:
 	free(rpath);
 	return rc;
